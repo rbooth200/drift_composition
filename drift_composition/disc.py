@@ -67,6 +67,9 @@ class DiscModel:
         self._compute_gas_surface_density()
         self.reset_molecules()
 
+        self._FV = FV_Model(grid, stencil=self._stencil)
+        self._FV_mol = FV_Model(grid, stencil=self._stencil, fields=2)
+
     _stencil = 3
 
     def aspect_ratio(self, R):
@@ -124,27 +127,40 @@ class DiscModel:
             Stokes number as a function of radius.
         Sc : float (default=1) or array, shape=grid.size+1
             Schmidt Number determining dust diffusion coefficient D = nu/Sc
-
         Notes
         -----
          - Neglects feedback
         """
+        self._Sigma_dust = np.zeros_like(self._grid.Rc, dtype="f8") # _update_dust needs this to exist
+        self._update_dust(np.inf, Mdot_dust, St, Sc=Sc)
+
+    def _update_dust(self, dt, Mdot_dust, St, Sc=1):
+        """Update the dust surface density structure using an implicit step.
+
+        Notes
+        -----
+        Setting dt=np.inf recovers the steady-state solution.
+        """
+        if dt == 0:
+            return
+
         g = self._grid
-        FV = FV_Model(g, self._stencil)
+        FV = self._FV
 
         adv = FV.create_advection_matrix(self.v_dust(g.Re, St(g.Re)))
         diff = FV.create_diffusion_matrix(self.nu(g.Re) / Sc, S=self._Sigma_gas)
-        mat = adv + diff
+        inv_dt = FV.create_linear_source_matrix(np.full_like(g.Rc, 1 / dt))
+        mat = inv_dt - (adv + diff)
 
-        source = np.zeros_like(g.Rc)
-        source[-1] = -Mdot_dust * Msun / yr
+        source = g.cell_vol * self._Sigma_dust / dt
+        source[-1] += Mdot_dust * Msun / yr
 
         self._St = St
         self._Sc = Sc
         self._Mdot_dust = Mdot_dust
         self._Sigma_dust = mat.solve(source)
 
-    def compute_chemistry(self, molecules, abundances, d2g=0.01):
+    def compute_chemistry(self, molecules, abundances, d2g=0.01, grain_size=None):
         """Solve the transport of molecular species to compute their surface
         density structure.
 
@@ -156,7 +172,6 @@ class DiscModel:
             Number abundance of the Molecules, relative to hydrogen.
         d2g : float, default=0.01
             Dust-to-gas mass ratio.
-
         Notes
         -----
         The accretion rate of the molecules is computed by working out
@@ -166,8 +181,22 @@ class DiscModel:
         determine whether the total flux of dust (and therefore ices) has been
         modified compared to the disc.
         """
+        for mol in molecules:
+            self._Sigma_mol[mol.name] = np.zeros([self._grid.size, 2], dtype="f8")
+        self._update_molecules(np.inf, molecules, abundances, d2g, grain_size=grain_size)
+
+    def _update_molecules(self, dt, molecules, abundances, d2g=0.01, grain_size=None):
+        """Update molecular surface densities using an implicit step.
+
+        Notes
+        -----
+        Setting dt=np.inf recovers the steady-state solution.
+        """
+        if dt == 0:
+            return
+
         g = self._grid
-        FV = FV_Model(g, self._stencil, fields=2)
+        FV = self._FV_mol
 
         # Create transport matrices
         v_gas = self.v_gas(g.Re)
@@ -180,10 +209,17 @@ class DiscModel:
             + FV.create_advection_matrix(v_dust, 1)
             + FV.create_diffusion_matrix(D, S=self.Sigma_gas, field=1)
         )
+        inv_dt = (
+            FV.create_linear_source_matrix(np.full_like(g.Rc, 1 / dt), field=0)
+            + FV.create_linear_source_matrix(np.full_like(g.Rc, 1 / dt), field=1)
+        )
 
         # Set the grain properties
         grains = GrainModel()
-        size = (2 / np.pi) * self.Stokes(g.Rc) * self.Sigma_gas / grains.rho
+        if grain_size is None:
+            size = (2 / np.pi) * self.Stokes(g.Rc) * self.Sigma_gas / grains.rho
+        else:
+            size = np.full_like(g.Rc, grain_size)
         T, H = self._T(g.Rc), self.aspect_ratio(g.Rc) * g.Rc
         Sig_d = self.Sigma_dust
 
@@ -226,15 +262,17 @@ class DiscModel:
             #        ([ads'(S) + des'(S)] * S - Mdot)
             # with S=0 as the initial guess.
 
-            Sigma = np.zeros(2 * g.size, dtype="f8")
-            Mdot = np.zeros(2 * g.size, dtype="f8")
-            Mdot[-2] = Mdot_vapor * Msun / yr
-            Mdot[-1] = Mdot_ice * Msun / yr
+            Sigma = self._Sigma_mol[mol.name].copy()
+            Mdot = g.cell_vol[:,None] * Sigma / dt
+
+            Mdot[-1,0] += Mdot_vapor * Msun / yr
+            Mdot[-1,1] += Mdot_ice * Msun / yr
+            Mdot = Mdot.flatten()
 
             for i in range(100):
                 # Create matrices for adsorption, desorption and jacobian
-                R_ads, j_ads = ads(Sigma[0::2], Sig_d, T, H, size)
-                R_des, j_des = des(Sigma[1::2], Sig_d, T, H, size)
+                R_ads, j_ads = ads(Sigma[:,0], Sig_d, T, H, size)
+                R_des, j_des = des(Sigma[:,1], Sig_d, T, H, size)
 
                 M = (
                     transport
@@ -247,18 +285,26 @@ class DiscModel:
 
                 J = J_ads + J_des
 
-                Sigma_new = (M + J).solve(J.dot(Sigma) - Mdot)
+                Sigma_new = (inv_dt - (M + J)).solve(Mdot - J.dot(Sigma.flatten()))
+                Sigma_new = np.maximum(Sigma_new.reshape(-1, 2),0)
 
-                abs_err = np.abs(Sigma_new - Sigma)
-                err = abs_err / (np.maximum(Sigma_new, Sigma) + 1e-300)
+
+                diff = np.abs(Sigma_new - Sigma)
+                abs_norm = np.maximum(Sigma_new.sum(1), Sigma.sum(1))[:, None] + 1e-300
+                rel_norm = np.maximum(Sigma_new, Sigma) + 1e-300
+
+                abs_err = diff / (1e-4 * abs_norm)
+                rel_err = diff / (1e-4 * rel_norm + 1e-15*abs_norm)
+
+                err = abs_err + rel_err
 
                 Sigma = Sigma_new
-                if err.max() < 1e-4:
+                if err.max() < 1:
                     break
             else:
                 raise RuntimeError(f"Run did not converge for {mol.name}")
 
-            self._Sigma_mol[mol.name] = Sigma.reshape(-1, 2)
+            self._Sigma_mol[mol.name] = Sigma
         self._molecules = self._molecules.union(set(molecules))
 
     def compute_elemental_column(self, dust=None):
@@ -380,3 +426,58 @@ class DiscModel:
     @property
     def Mdot_dust(self):
         return self._Mdot_dust
+
+
+class TimeDependentDiscModel(DiscModel):
+    """Model for time-dependent chemiscal transport in a disc.
+
+    Parameters
+    ----------
+    grid : Grid object
+        Radial grid for the disc
+    Mdot : float, units= M_sun / year
+        Gas mass accretion rate.
+    alpha : function, alpha(R)
+        Turbulent alpha parameters as function of R
+    T : function, T(R)
+        Temperature in K as a function of R
+    Mstar : float, default=1, unit=Msun
+        Stellar mass
+    mu : float, default=1
+        Mean molecular weight.
+    """
+
+    def __init__(self, grid, Mdot, alpha, T, Mstar=1, mu=2.35):
+        super().__init__(grid, Mdot, alpha, T, Mstar=Mstar, mu=mu)
+
+        self._age = 0
+
+
+    def init(self, dust_to_gas, St, molecules, abundances, Sc=1):
+        """Initialize the dust and molecules, assuming steady-state accretion."""
+        self.compute_dust_surface_density(dust_to_gas * self.Mdot_gas, St, Sc=Sc)
+        self.compute_chemistry(molecules, abundances, d2g=dust_to_gas)
+
+        self._dust_to_gas = dust_to_gas
+        self._abundances = abundances
+
+    def update(self, dt, Mdot_dust, St):
+        """Update the disc structure by a time-step dt.
+
+        Parameters
+        ----------
+        dt : float, units=yr/2pi
+            Time-step to evolve the disc.
+        Mdot_dust : float, units=Msun/year
+            Accretion rate of dust
+        St : callable,
+            Stokes number as a function of radius.
+        """
+        self._age += dt
+
+        self._update_dust(dt, Mdot_dust, St, Sc=self.Schmidt)
+        self._update_molecules(dt, self.Molecules, self._abundances, d2g=self._dust_to_gas)
+
+    @property
+    def age(self):
+        return self._age

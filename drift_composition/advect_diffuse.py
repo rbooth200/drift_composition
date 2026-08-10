@@ -237,7 +237,7 @@ class FV_Model:
         -----
          - A first order reconstruction is used.
         """
-        return self._create_banded((0, 0), (rate * self.grid.cell_vol)[:, None], field)
+        return self._create_banded((0,), (rate * self.grid.cell_vol)[:, None], field)
 
     def get_field_ids(self, field):
         """Get the indices that select the variables corresponding to the field."""

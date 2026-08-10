@@ -20,7 +20,7 @@
 A 1D model for the advection and diffusion of molecules through protoplanetary
 discs.
 """
-__version__ = "_0.1.0"
+__version__ = "0.1.0"
 
 from drift_composition import adsorb_desorb
 from drift_composition import advect_diffuse
